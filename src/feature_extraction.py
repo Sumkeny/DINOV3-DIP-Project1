@@ -1,4 +1,4 @@
-# feature_extraction.py
+# src/feature_extraction.py (已修改以适应 Colab)
 import torch
 from torchvision import transforms
 from torch.utils.data import DataLoader, Dataset
@@ -8,11 +8,10 @@ import os
 from tqdm import tqdm
 import argparse
 
-# Import the model from our model.py file
-from model import DINOv3Backbone
+# 确认 model.py 在同一个目录下或 Python 路径中
+from model import DINOV3Backbone
 
 class ImageDataset(Dataset):
-    """A simple dataset to load images from a directory."""
     def __init__(self, image_dir, transform=None):
         self.image_dir = image_dir
         self.image_paths = sorted([os.path.join(image_dir, f) for f in os.listdir(image_dir) if f.endswith(('.jpg', '.png', '.jpeg'))])
@@ -32,49 +31,49 @@ def main(args):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
 
-    # 1. Model and Transformation
-    model = DINOv3Backbone().to(device).eval()
+    # --- 关键修改：从 args 组合路径 ---
+    image_dir = os.path.join(args.data_dir, args.subdir)
+    output_path = os.path.join(args.output_dir, f"{args.output_prefix}_feats.npz")
+    print(f"Processing images from: {image_dir}")
+    # ------------------------------------
+
+    if not os.path.isdir(image_dir):
+        raise FileNotFoundError(f"Image directory not found: {image_dir}")
+
+    model = DINOV3Backbone().to(device).eval()
     
     transform = transforms.Compose([
-        transforms.Resize((256, 128)), # Standard Re-ID size
+        transforms.Resize((256, 128)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
-    # 2. Dataset and DataLoader
-    dataset = ImageDataset(args.image_dir, transform=transform)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
+    dataset = ImageDataset(image_dir, transform=transform)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
 
-    # 3. Feature Extraction Loop
     all_features = []
     all_paths = []
     with torch.no_grad():
-        for imgs, paths in tqdm(dataloader, desc=f"Extracting features from {os.path.basename(args.image_dir)}"):
+        for imgs, paths in tqdm(dataloader, desc=f"Extracting from {args.subdir}"):
             imgs = imgs.to(device)
-            # Use the extract_global method which includes L2 normalization
             features = model.extract_global(imgs)
-            
             all_features.append(features.cpu().numpy())
             all_paths.extend(paths)
 
     all_features = np.vstack(all_features)
 
-    # 4. Save features
-    os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
-    # Use np.savez to save both features and paths for easy loading later
-    np.savez(args.output_path, features=all_features, paths=np.array(all_paths))
-    print(f"Extracted {len(all_features)} features. Saved to {args.output_path}")
-    print(f"Feature matrix shape: {all_features.shape}")
+    os.makedirs(args.output_dir, exist_ok=True)
+    np.savez(output_path, features=all_features, paths=np.array(all_paths))
+    print(f"Extracted {len(all_features)} features. Saved to {output_path}")
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Extract features from images for Re-ID.")
-    parser.add_argument('--image_dir', type=str, required=True, help="Path to the directory containing images (e.g., 'data/market1501/query/')")
-    parser.add_argument('--output_path', type=str, required=True, help="Path to save the extracted features (e.g., 'features/query_feats.npz')")
+    parser = argparse.ArgumentParser(description="Extract features for Re-ID.")
+    # --- 关键修改：更新命令行参数 ---
+    parser.add_argument('--data_dir', type=str, required=True, help="Base directory of the dataset (e.g., '/content/datasets/market1501/')")
+    parser.add_argument('--subdir', type=str, required=True, help="Subdirectory to process (e.g., 'query' or 'bounding_box_test')")
+    parser.add_argument('--output_dir', type=str, required=True, help="Directory to save the features.")
+    parser.add_argument('--output_prefix', type=str, required=True, help="Prefix for the output .npz file (e.g., 'baseline_query')")
     parser.add_argument('--batch_size', type=int, default=64, help="Batch size for feature extraction.")
     
     args = parser.parse_args()
     main(args)
-
-# Example command line usage:
-# python feature_extraction.py --image_dir path/to/market1501/query --output_path features/market1501/query_feats.npz
-# python feature_extraction.py --image_dir path/to/market1501/bounding_box_test --output_path features/market1501/gallery_feats.npz
