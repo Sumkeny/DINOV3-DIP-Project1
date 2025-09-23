@@ -1,5 +1,7 @@
+# file: src/feature_extraction.py
 import os
 import torch
+from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from PIL import Image
 from torchvision import transforms
@@ -8,19 +10,32 @@ import argparse
 import pickle
 import glob
 import re
+
+# 假设 model.py 在同级目录下
 from model import DINOv3ReID, AdapterHead
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Feature Extraction with Batched File Saving")
-    parser.add_argument('--data_dir', type=str, required=True, help="Path to dataset root")
-    parser.add_argument('--subdir', type=str, required=True, choices=['query', 'bounding_box_test'], help="Subdirectory to process")
-    parser.add_argument('--output_dir', type=str, required=True, help="Directory to save feature files")
-    parser.add_argument('--output_prefix', type=str, required=True, help="Prefix for the output pkl files (e.g., 'baseline_query')")
-    parser.add_argument('--adapter_path', type=str, default=None, help="Path to trained adapter weights")
-    parser.add_argument('--batch_save_size', type=int, default=4000, help="Batch size for saving to separate files. Lower this if still OOM.")
-    return parser.parse_args()
+# --- 为批处理定义一个 PyTorch Dataset ---
+class ImageDataset(Dataset):
+    def __init__(self, image_dir, transform=None):
+        self.image_dir = image_dir
+        # 过滤掉非图片文件和 Market-1501 的干扰项
+        self.image_files = sorted([f for f in os.listdir(image_dir) if f.endswith(('.jpg', '.png')) and not f.startswith('-1')])
+        self.transform = transform
 
-def extract_and_save_features_final(model, adapter, data_dir, subdir, output_dir, output_prefix, batch_save_size, device):
+    def __len__(self):
+        return len(self.image_files)
+
+    def __getitem__(self, idx):
+        img_name = self.image_files[idx]
+        img_path = os.path.join(self.image_dir, img_name)
+        image = Image.open(img_path).convert('RGB')
+        
+        if self.transform:
+            image = self.transform(image)
+        
+        return image, img_name
+
+def extract_and_save_features_batched(model, adapter, data_dir, subdir, output_dir, output_prefix, device, batch_size=64):
     transform = transforms.Compose([
         transforms.Resize((256, 128)),
         transforms.ToTensor(),
@@ -28,82 +43,94 @@ def extract_and_save_features_final(model, adapter, data_dir, subdir, output_dir
     ])
     
     img_dir = os.path.join(data_dir, subdir)
-    image_files = sorted([f for f in os.listdir(img_dir) if f.endswith(('.jpg', '.png'))])
-    
-    # Clean up old part files before starting
-    old_files = glob.glob(os.path.join(output_dir, f"{output_prefix}_part_*.pkl"))
-    if old_files:
-        print(f"Removing {len(old_files)} old part files...")
-        for f in old_files: os.remove(f)
+    dataset = ImageDataset(img_dir, transform=transform)
+    # 使用 DataLoader 进行高效批处理加载
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
 
-    batch_data = {'img_paths': [], 'pids': [], 'camids': [], 'features': []}
-    part_num = 0
-    
-    print(f"Extracting features from {subdir} and saving in parts...")
+    all_features = []
+    all_pids = []
+    all_camids = []
+    all_img_paths = []
+
     model.eval()
     if adapter:
         adapter.eval()
-
-    for i, img_name in enumerate(tqdm(image_files)):
-        if img_name.startswith('-1'): continue
-        
-        img_path = os.path.join(img_dir, img_name)
-        try:
-            pid = int(img_name.split('_')[0])
+    
+    print(f"Extracting features from {subdir} in batches...")
+    
+    with torch.no_grad():
+        for images, img_names in tqdm(dataloader):
+            images = images.to(device)
             
-            # 使用正则表达式来可靠地找到摄像头ID。
-            # r'c(\d+)' 会寻找字母 'c' 后面跟着的一个或多个数字 (\d+)。
-            match = re.search(r'c(\d+)', img_name)
-            if not match:
-                raise ValueError("在文件名中未找到 CamID 模式 'c<数字>'")
+            backbone_feats = model(images)
             
-            camid = int(match.group(1)) # .group(1) 获取括号里匹配到的数字。
-
-        except (ValueError, IndexError, AttributeError):
-            print(f"警告: 无法从文件名 {img_name} 中解析PID/CamID。正在跳过。")
-            continue
-        
-        img = Image.open(img_path).convert('RGB')
-        img_tensor = transform(img).unsqueeze(0).to(device)
-        
-        with torch.no_grad():
-            backbone_feat = model(img_tensor)
             if adapter:
-                _, final_feat = adapter(backbone_feat)
-                final_feat = torch.nn.functional.normalize(final_feat, dim=1)
+                _, final_feats = adapter(backbone_feats)
+                final_feats = torch.nn.functional.normalize(final_feats, dim=1)
             else:
-                final_feat = backbone_feat
-        
-        batch_data['img_paths'].append(img_path)
-        batch_data['pids'].append(pid)
-        batch_data['camids'].append(camid)
-        batch_data['features'].append(final_feat.cpu().numpy())
-        
-        if (i + 1) % batch_save_size == 0 or (i + 1) == len(image_files):
-            batch_data['features'] = np.vstack(batch_data['features'])
-            output_path = os.path.join(output_dir, f"{output_prefix}_part_{part_num}.pkl")
-            
-            with open(output_path, 'wb') as f:
-                pickle.dump(batch_data, f)
-            
-            print(f"Saved part {part_num} to {output_path}")
-            part_num += 1
-            batch_data = {'img_paths': [], 'pids': [], 'camids': [], 'features': []}
+                final_feats = backbone_feats
 
-    print(f"Finished extracting features for {subdir}.")
+            all_features.append(final_feats.cpu().numpy())
+            
+            # --- 这是最关键的 Bug 修复 ---
+            for img_name in img_names:
+                # 解析 PID
+                pid = int(img_name.split('_')[0])
+                
+                # 使用正则表达式可靠地解析 CamID
+                match = re.search(r'c(\d+)', img_name)
+                if match:
+                    camid = int(match.group(1))
+                else:
+                    # 如果解析失败，给一个默认值并警告，而不是让程序崩溃或使用错误值
+                    camid = -1 
+                    print(f"Warning: Could not parse CamID from {img_name}")
+                
+                all_pids.append(pid)
+                all_camids.append(camid)
+                all_img_paths.append(os.path.join(img_dir, img_name))
+
+    # 将所有批次的特征合并成一个大的 Numpy 数组
+    all_features = np.vstack(all_features)
+
+    # 保存到一个单一的 pickle 文件中
+    output_path = os.path.join(output_dir, f"{output_prefix}.pkl")
+    data_to_save = {
+        'img_paths': all_img_paths,
+        'pids': all_pids,
+        'camids': all_camids,
+        'features': all_features
+    }
+    
+    with open(output_path, 'wb') as f:
+        pickle.dump(data_to_save, f)
+        
+    print(f"Saved all features for {subdir} to {output_path}")
+
+# --- 由于不再分批保存，evaluate.py 也需要一个小修改 ---
+# 我们可以在这里直接提供新的 load_features 函数，或者修改 evaluate.py
+# 为简单起见，我将在下面提供修改后的 evaluate.py
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Batched Feature Extraction")
+    parser.add_argument('--data_dir', type=str, required=True, help="Path to dataset root")
+    parser.add_argument('--subdir', type=str, required=True, choices=['query', 'bounding_box_test'], help="Subdirectory to process")
+    parser.add_argument('--output_dir', type=str, required=True, help="Directory to save the feature file")
+    parser.add_argument('--output_prefix', type=str, required=True, help="Prefix for the output pkl file")
+    parser.add_argument('--adapter_path', type=str, default=None)
+    parser.add_argument('--batch_size', type=int, default=128, help="Batch size for feature extraction")
+    return parser.parse_args()
 
 if __name__ == '__main__':
     args = parse_args()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     model = DINOv3ReID().to(device)
-    model.eval()
     adapter = None
     if args.adapter_path:
         adapter = AdapterHead().to(device)
         adapter.load_state_dict(torch.load(args.adapter_path))
-        adapter.eval()
-        
+    
     os.makedirs(args.output_dir, exist_ok=True)
     
-    extract_and_save_features_final(model, adapter, args.data_dir, args.subdir, args.output_dir, args.output_prefix, args.batch_save_size, device)
+    extract_and_save_features_batched(model, adapter, args.data_dir, args.subdir, args.output_dir, args.output_prefix, device, args.batch_size)

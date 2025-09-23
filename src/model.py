@@ -6,8 +6,8 @@ import timm
 
 # --- 模型配置 (使用 timm 加载 DINOv3 ViT-Base) ---
 # 这是正确的 DINOv3 模型名称
-#MODEL_NAME = 'vit_base_patch16_dinov3.lvd1689m'
-MODEL_NAME = 'vit_base_patch16_dinov3'
+MODEL_NAME = 'vit_base_patch16_dinov3.lvd1689m'
+
 FEATURE_DIM = 768  # ViT-Base's feature dimension
 
 class DINOv3ReID(nn.Module):

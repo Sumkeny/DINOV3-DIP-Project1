@@ -1,35 +1,48 @@
+# file: test_model.py
 import torch
-from model import DINOv3ReID, FEATURE_DIM # 从修正后的 model.py 导入
+import sys
 
-print("--- Testing DINOv3 Feature Extractor ---")
+# 将 src 目录添加到 Python 路径中，这样才能找到 model 模块
+sys.path.append('src')
 
-try:
-    # 1. 初始化模型
-    print("Initializing model...")
-    model = DINOv3ReID()
-    model.eval()
-    print("Model initialized successfully.")
+# 现在可以从 src/model.py 导入了
+from model import DINOv3ReID
 
-    # 2. 创建一个测试输入
-    # 批大小=1, 通道=3, 高=256, 宽=128
-    test_input = torch.randn(1, 3, 256, 128)
-    print(f"Created test input with shape: {test_input.shape}")
+def run_test():
+    """独立测试 model.py 是否能正常工作"""
+    print("="*20 + " Starting Model Test " + "="*20)
+    try:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        print(f"Using device: {device}")
+        if device == 'cuda':
+            print("GPU Name:", torch.cuda.get_device_name(0))
 
-    # 3. 进行前向传播
-    print("Performing forward pass...")
-    with torch.no_grad():
-        output = model(test_input)
-    print("Forward pass successful.")
+        # --- 关键测试 1: 尝试创建模型实例 ---
+        print("\nStep 1: Attempting to create DINOv3ReID model instance...")
+        model_instance = DINOv3ReID()
+        model_instance.to(device)
+        print("✅ SUCCESS: Model instance created and moved to device successfully!")
 
-    # 4. 检查输出形状
-    print(f"Output shape: {output.shape}")
-    
-    # 5. 验证形状是否正确
-    expected_shape = torch.Size([1, FEATURE_DIM])
-    if output.shape == expected_shape:
-        print(f"\nSUCCESS! The output shape {output.shape} is correct.")
-    else:
-        print(f"\nFAILURE! Expected shape {expected_shape}, but got {output.shape}.")
+        # --- 关键测试 2: 尝试一次前向传播 ---
+        print("\nStep 2: Attempting a forward pass with a dummy image tensor...")
+        dummy_input = torch.randn(1, 3, 224, 224).to(device)
+        
+        with torch.no_grad():
+            output_features = model_instance(dummy_input)
+        
+        print("✅ SUCCESS: Forward pass completed successfully!")
+        print(f"Output feature shape: {output_features.shape}")
+        print(f"Expected feature shape: (1, {model_instance.feat_dim})")
+        
+        assert output_features.shape == (1, model_instance.feat_dim), "Output shape is incorrect!"
+        print("✅ SUCCESS: Output feature shape is correct.")
 
-except Exception as e:
-    print(f"\nAn error occurred during the test: {e}")
+    except Exception as e:
+        print(f"\n❌ FAILED: An error occurred during the test.")
+        print(f"Error Type: {type(e).__name__}")
+        print(f"Error Message: {e}")
+
+    print("\n" + "="*20 + " Model Test Finished " + "="*20)
+
+if __name__ == "__main__":
+    run_test()
