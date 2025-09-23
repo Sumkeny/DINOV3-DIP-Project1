@@ -1,4 +1,4 @@
-# src/feature_extraction.py (已修改以适应 Colab)
+# src/feature_extraction.py (已修正导入错误)
 import torch
 from torchvision import transforms
 from torch.utils.data import DataLoader, Dataset
@@ -9,7 +9,8 @@ from tqdm import tqdm
 import argparse
 
 # 确认 model.py 在同一个目录下或 Python 路径中
-from model import DINOV3Backbone
+# --- 这里的导入名称已被修正 ---
+from model import DINOv3Backbone
 
 class ImageDataset(Dataset):
     def __init__(self, image_dir, transform=None):
@@ -31,16 +32,14 @@ def main(args):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
 
-    # --- 关键修改：从 args 组合路径 ---
     image_dir = os.path.join(args.data_dir, args.subdir)
     output_path = os.path.join(args.output_dir, f"{args.output_prefix}_feats.npz")
     print(f"Processing images from: {image_dir}")
-    # ------------------------------------
 
     if not os.path.isdir(image_dir):
         raise FileNotFoundError(f"Image directory not found: {image_dir}")
 
-    model = DINOV3Backbone().to(device).eval()
+    model = DINOv3Backbone().to(device).eval()
     
     transform = transforms.Compose([
         transforms.Resize((256, 128)),
@@ -68,7 +67,6 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Extract features for Re-ID.")
-    # --- 关键修改：更新命令行参数 ---
     parser.add_argument('--data_dir', type=str, required=True, help="Base directory of the dataset (e.g., '/content/datasets/market1501/')")
     parser.add_argument('--subdir', type=str, required=True, help="Subdirectory to process (e.g., 'query' or 'bounding_box_test')")
     parser.add_argument('--output_dir', type=str, required=True, help="Directory to save the features.")
