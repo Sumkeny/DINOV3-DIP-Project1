@@ -7,7 +7,7 @@ from tqdm import tqdm
 import argparse
 import pickle
 import glob
-
+import re
 from model import DINOv3ReID, AdapterHead
 
 def parse_args():
@@ -40,13 +40,29 @@ def extract_and_save_features_final(model, adapter, data_dir, subdir, output_dir
     part_num = 0
     
     print(f"Extracting features from {subdir} and saving in parts...")
-    
+    model.eval()
+    if adapter:
+        adapter.eval()
+
     for i, img_name in enumerate(tqdm(image_files)):
         if img_name.startswith('-1'): continue
         
         img_path = os.path.join(img_dir, img_name)
-        pid = int(img_name.split('_')[0])
-        camid = int(img_name.split('_')[1][1])
+        try:
+            pid = int(img_name.split('_')[0])
+            
+            # 使用正则表达式来可靠地找到摄像头ID。
+            # r'c(\d+)' 会寻找字母 'c' 后面跟着的一个或多个数字 (\d+)。
+            match = re.search(r'c(\d+)', img_name)
+            if not match:
+                raise ValueError("在文件名中未找到 CamID 模式 'c<数字>'")
+            
+            camid = int(match.group(1)) # .group(1) 获取括号里匹配到的数字。
+
+        except (ValueError, IndexError, AttributeError):
+            print(f"警告: 无法从文件名 {img_name} 中解析PID/CamID。正在跳过。")
+            continue
+        
         img = Image.open(img_path).convert('RGB')
         img_tensor = transform(img).unsqueeze(0).to(device)
         
