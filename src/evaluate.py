@@ -1,110 +1,105 @@
-# src/evaluate.py (已修改以适应 Colab)
+# file: src/evaluate.py
+import os
 import numpy as np
 import faiss
-import os
-import argparse
+import pickle
 from tqdm import tqdm
+import argparse
 
-def parse_filename_market1501(filename):
-    base = os.path.basename(filename)
-    parts = base.split('_')
-    # 处理 'junk' or 'distractors' 图片, 它们的 person ID 为 -1 或 0
-    if parts[0] in ['-1', '0000']:
-        return -1, -1
-    person_id = int(parts[0])
-    camera_id = int(parts[1][1])
-    return person_id, camera_id
-
-def evaluate_reid(query_feats, query_paths, gallery_feats, gallery_paths, top_k=100):
-    index = faiss.IndexFlatIP(gallery_feats.shape[1])
-    index.add(gallery_feats)
-    print(f"Faiss index built with {index.ntotal} gallery features.")
-
-    D, I = index.search(query_feats, k=top_k)
-
-    query_pids = np.array([parse_filename_market1501(p)[0] for p in query_paths])
-    query_cids = np.array([parse_filename_market1501(p)[1] for p in query_paths])
-    gallery_pids = np.array([parse_filename_market1501(p)[0] for p in gallery_paths])
-    gallery_cids = np.array([parse_filename_market1501(p)[1] for p in gallery_paths])
+def evaluate(query_features, query_pids, query_camids, gallery_features, gallery_pids, gallery_camids):
+    # 使用 Faiss 构建索引，L2 归一化后内积等价于余弦相似度
+    index = faiss.IndexFlatIP(gallery_features.shape[1])
+    index.add(gallery_features)
     
+    # 搜索
+    D, I = index.search(query_features, k=len(gallery_pids))
+    
+    all_AP = []
     cmc = np.zeros(len(gallery_pids))
-    all_ap = []
-    num_valid_queries = 0
-
-    for i in tqdm(range(len(query_feats)), desc="Evaluating"):
+    
+    for i in tqdm(range(len(query_pids)), desc="Evaluating"):
         query_pid = query_pids[i]
-        query_cid = query_cids[i]
+        query_camid = query_camids[i]
         
-        ranked_indices = I[i]
-        ranked_gallery_pids = gallery_pids[ranked_indices]
-        ranked_gallery_cids = gallery_cids[ranked_indices]
+        # 获取排序结果
+        retrieved_indices = I[i]
+        retrieved_pids = gallery_pids[retrieved_indices]
+        retrieved_camids = gallery_camids[retrieved_indices]
         
-        valid_mask = ~((ranked_gallery_pids == query_pid) & (ranked_gallery_cids == query_cid))
-        valid_mask &= (ranked_gallery_pids != -1)
+        # 识别 Good Match 和 Junk Match
+        is_good_match = (retrieved_pids == query_pid) & (retrieved_camids != query_camid)
+        is_junk_match = (retrieved_pids == query_pid) & (retrieved_camids == query_camid)
         
-        clean_gallery_pids = ranked_gallery_pids[valid_mask]
+        # 创建 mask 以移除 Junk Match
+        mask_keep = ~is_junk_match
         
-        # 修正：gallery_pids[valid_gallery_mask]
-        valid_gallery_mask = (gallery_pids != -1)
-        gt_matches = np.sum(gallery_pids[valid_gallery_mask] == query_pid)
-        if gt_matches == 0:
+        if not np.any(is_good_match):
             continue
         
-        num_valid_queries += 1
-        
-        matches_at_k = (clean_gallery_pids == query_pid)
-        match_found = np.any(matches_at_k)
-
-        if match_found:
-            first_match_idx = np.where(matches_at_k)[0][0]
-            cmc[first_match_idx:] += 1
-
-        if not match_found:
-            all_ap.append(0)
+        # mAP 计算
+        final_ranked_good_matches = is_good_match[mask_keep]
+        num_relevant = np.sum(final_ranked_good_matches)
+        if num_relevant == 0:
+            all_AP.append(0.0)
             continue
             
-        hits = np.cumsum(matches_at_k)
-        precision_at_k = hits / (np.arange(len(clean_gallery_pids)) + 1)
-        ap = np.sum(precision_at_k * matches_at_k) / gt_matches
-        all_ap.append(ap)
+        cumulative_matches = np.cumsum(final_ranked_good_matches)
+        precision_at_k = cumulative_matches / (np.arange(len(final_ranked_good_matches)) + 1)
+        
+        AP = np.sum(precision_at_k * final_ranked_good_matches) / num_relevant
+        all_AP.append(AP)
+        
+        # CMC (Rank-k) 计算
+        first_good_match_idx = np.where(final_ranked_good_matches)[0]
+        if len(first_good_match_idx) > 0:
+            rank = first_good_match_idx[0]
+            cmc[rank:] += 1
 
-    cmc = cmc / num_valid_queries
-    mAP = np.mean(all_ap)
-    
-    return cmc[0], mAP
+    if len(all_AP) == 0:
+        print("Warning: No valid queries found during evaluation.")
+        return 0.0, 0.0
 
-def main(args):
-    # --- 关键修改：从 args 组合路径 ---
-    query_path = os.path.join(args.feats_dir, f"{args.query_prefix}_feats.npz")
-    gallery_path = os.path.join(args.feats_dir, f"{args.gallery_prefix}_feats.npz")
-    # ----------------------------------
+    mAP = np.mean(all_AP)
+    cmc = cmc / len(all_AP)
+    rank1 = cmc[0]
+    
+    return rank1, mAP
 
-    query_data = np.load(query_path)
-    query_feats = query_data['features']
-    query_paths = query_data['paths']
-    
-    gallery_data = np.load(gallery_path)
-    gallery_feats = gallery_data['features']
-    gallery_paths = gallery_data['paths']
-    
-    print(f"Loaded {len(query_feats)} query features from {query_path}")
-    print(f"Loaded {len(gallery_feats)} gallery features from {gallery_path}")
-
-    rank1, mAP = evaluate_reid(query_feats, query_paths, gallery_feats, gallery_paths)
-    
-    print("\n" + "---" * 10)
-    print(" Baseline Evaluation Results on Market-1501")
-    print("---" * 10)
-    print(f"  Rank-1 Accuracy: {rank1:.2%}")
-    print(f"  mAP            : {mAP:.2%}")
-    print("---" * 10)
+def load_features(feats_path):
+    """直接从单一的 .pkl 文件加载特征。"""
+    if not os.path.exists(feats_path):
+        raise FileNotFoundError(f"Feature file not found at: {feats_path}")
+    with open(feats_path, 'rb') as f:
+        data = pickle.load(f)
+    data['pids'] = np.array(data['pids'])
+    data['camids'] = np.array(data['camids'])
+    return data
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Evaluate Re-ID performance.")
-    # --- 关键修改：更新命令行参数 ---
-    parser.add_argument('--feats_dir', type=str, required=True, help="Directory where feature files are stored.")
-    parser.add_argument('--query_prefix', type=str, required=True, help="Prefix of the query features file.")
-    parser.add_argument('--gallery_prefix', type=str, required=True, help="Prefix of the gallery features file.")
-    
+    parser = argparse.ArgumentParser(description="Evaluation Script for Re-ID")
+    parser.add_argument('--feats_dir', type=str, required=True, help="Directory containing the feature files")
+    parser.add_argument('--query_prefix', type=str, required=True, help="Prefix for the query feature file")
+    parser.add_argument('--gallery_prefix', type=str, required=True, help="Prefix for the gallery feature file")
     args = parser.parse_args()
-    main(args)
+
+    query_path = os.path.join(args.feats_dir, f"{args.query_prefix}.pkl")
+    gallery_path = os.path.join(args.feats_dir, f"{args.gallery_prefix}.pkl")
+
+    print(f"Loading query features from {query_path}...")
+    query_data = load_features(query_path)
+    
+    print(f"Loading gallery features from {gallery_path}...")
+    gallery_data = load_features(gallery_path)
+    
+    print(f"Query size: {len(query_data['pids'])}, Gallery size: {len(gallery_data['pids'])}")
+    
+    rank1, mAP = evaluate(
+        query_data['features'], query_data['pids'], query_data['camids'],
+        gallery_data['features'], gallery_data['pids'], gallery_data['camids']
+    )
+    
+    print("="*20)
+    print(f"Results for: {args.query_prefix.replace('_query', '')}")
+    print(f"Rank-1: {rank1:.4f} ({rank1:.2%})")
+    print(f"mAP:    {mAP:.4f} ({mAP:.2%})")
+    print("="*20)
