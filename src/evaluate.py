@@ -1,105 +1,80 @@
-# file: src/evaluate.py
-import os
 import numpy as np
 import faiss
-import pickle
 from tqdm import tqdm
 import argparse
+import os
 
-def evaluate(query_features, query_pids, query_camids, gallery_features, gallery_pids, gallery_camids):
-    # 使用 Faiss 构建索引，L2 归一化后内积等价于余弦相似度
+from config import *
+
+def evaluate(query_features, query_pids, query_camids, gallery_features, gallery_pids, gallery_camids, top_k=TOP_K):
+    # 构建 Faiss 索引
     index = faiss.IndexFlatIP(gallery_features.shape[1])
     index.add(gallery_features)
-    
+
     # 搜索
-    D, I = index.search(query_features, k=len(gallery_pids))
-    
-    all_AP = []
-    cmc = np.zeros(len(gallery_pids))
-    
+    D, I = index.search(query_features, k=top_k)
+
+    # 计算 CMC (Cumulative Matching Characteristics) for Rank-k
+    cmc = np.zeros(top_k)
+    # 计算 AP (Average Precision)
+    aps = []
+
     for i in tqdm(range(len(query_pids)), desc="Evaluating"):
         query_pid = query_pids[i]
         query_camid = query_camids[i]
         
-        # 获取排序结果
-        retrieved_indices = I[i]
-        retrieved_pids = gallery_pids[retrieved_indices]
-        retrieved_camids = gallery_camids[retrieved_indices]
+        # 检索到的 gallery 索引
+        gallery_indices = I[i]
         
-        # 识别 Good Match 和 Junk Match
-        is_good_match = (retrieved_pids == query_pid) & (retrieved_camids != query_camid)
-        is_junk_match = (retrieved_pids == query_pid) & (retrieved_camids == query_camid)
+        # 检索到的 pid 和 camid
+        retrieved_pids = gallery_pids[gallery_indices]
+        retrieved_camids = gallery_camids[gallery_indices]
         
-        # 创建 mask 以移除 Junk Match
-        mask_keep = ~is_junk_match
+        # 移除同一摄像头下的同一ID (Re-ID 评估标准)
+        valid_indices = (retrieved_pids != query_pid) | (retrieved_camids != query_camid)
         
-        if not np.any(is_good_match):
-            continue
+        # 筛选出有效的匹配结果
+        matches = (retrieved_pids[valid_indices] == query_pid)
         
-        # mAP 计算
-        final_ranked_good_matches = is_good_match[mask_keep]
-        num_relevant = np.sum(final_ranked_good_matches)
-        if num_relevant == 0:
-            all_AP.append(0.0)
+        if not np.any(matches):
+            aps.append(0)
             continue
             
-        cumulative_matches = np.cumsum(final_ranked_good_matches)
-        precision_at_k = cumulative_matches / (np.arange(len(final_ranked_good_matches)) + 1)
-        
-        AP = np.sum(precision_at_k * final_ranked_good_matches) / num_relevant
-        all_AP.append(AP)
-        
-        # CMC (Rank-k) 计算
-        first_good_match_idx = np.where(final_ranked_good_matches)[0]
-        if len(first_good_match_idx) > 0:
-            rank = first_good_match_idx[0]
-            cmc[rank:] += 1
+        # CMC
+        cmc[np.where(matches)[0][0]:] += 1
 
-    if len(all_AP) == 0:
-        print("Warning: No valid queries found during evaluation.")
-        return 0.0, 0.0
-
-    mAP = np.mean(all_AP)
-    cmc = cmc / len(all_AP)
-    rank1 = cmc[0]
+        # mAP
+        num_relevant = np.sum(matches)
+        precision_at_k = np.cumsum(matches) / (np.arange(len(matches)) + 1)
+        ap = np.sum(precision_at_k * matches) / num_relevant
+        aps.append(ap)
+        
+    cmc /= len(query_pids)
+    mAP = np.mean(aps)
     
-    return rank1, mAP
-
-def load_features(feats_path):
-    """直接从单一的 .pkl 文件加载特征。"""
-    if not os.path.exists(feats_path):
-        raise FileNotFoundError(f"Feature file not found at: {feats_path}")
-    with open(feats_path, 'rb') as f:
-        data = pickle.load(f)
-    data['pids'] = np.array(data['pids'])
-    data['camids'] = np.array(data['camids'])
-    return data
+    return cmc, mAP
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Evaluation Script for Re-ID")
-    parser.add_argument('--feats_dir', type=str, required=True, help="Directory containing the feature files")
-    parser.add_argument('--query_prefix', type=str, required=True, help="Prefix for the query feature file")
-    parser.add_argument('--gallery_prefix', type=str, required=True, help="Prefix for the gallery feature file")
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset', type=str, required=True)
+    parser.add_argument('--adapted', action='store_true', help='Use features from adapted model')
     args = parser.parse_args()
 
-    query_path = os.path.join(args.feats_dir, f"{args.query_prefix}.pkl")
-    gallery_path = os.path.join(args.feats_dir, f"{args.gallery_prefix}.pkl")
+    # 加载特征
+    feature_dir = os.path.join(OUTPUT_DIR, 'features', args.dataset)
+    suffix = '_adapted.npz' if args.adapted else '.npz'
+    
+    query_data = np.load(os.path.join(feature_dir, 'query_features' + suffix))
+    gallery_data = np.load(os.path.join(feature_dir, 'gallery_features' + suffix))
+    
+    query_features, query_pids, query_camids = query_data['features'], query_data['pids'], query_data['camids']
+    gallery_features, gallery_pids, gallery_camids = gallery_data['features'], gallery_data['pids'], gallery_data['camids']
+    
+    # 评估
+    cmc, mAP = evaluate(query_features, query_pids, query_camids, gallery_features, gallery_pids, gallery_camids)
 
-    print(f"Loading query features from {query_path}...")
-    query_data = load_features(query_path)
-    
-    print(f"Loading gallery features from {gallery_path}...")
-    gallery_data = load_features(gallery_path)
-    
-    print(f"Query size: {len(query_data['pids'])}, Gallery size: {len(gallery_data['pids'])}")
-    
-    rank1, mAP = evaluate(
-        query_data['features'], query_data['pids'], query_data['camids'],
-        gallery_data['features'], gallery_data['pids'], gallery_data['camids']
-    )
-    
-    print("="*20)
-    print(f"Results for: {args.query_prefix.replace('_query', '')}")
-    print(f"Rank-1: {rank1:.4f} ({rank1:.2%})")
-    print(f"mAP:    {mAP:.4f} ({mAP:.2%})")
-    print("="*20)
+    print(f"--- Results for {args.dataset} {'(Adapted)' if args.adapted else '(Baseline)'} ---")
+    print(f"mAP: {mAP:.4f}")
+    print(f"Rank-1: {cmc[0]:.4f}")
+    print(f"Rank-5: {cmc[4]:.4f}")
+    print(f"Rank-10: {cmc[9]:.4f}")
